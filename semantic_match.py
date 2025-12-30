@@ -76,7 +76,11 @@ def get_match(
     t0 = time.time()
 
     if not os.path.exists("mask_nd"):
-        mask = get_mask(_SRC_IMG_PATH, _SRC_DOMAIN)
+        try:
+            mask = get_mask(_SRC_IMG_PATH, _SRC_DOMAIN)
+        except Exception as e:
+            print(f"ERR% {e}")
+            mask = np.ones((h_tar, w_tar))
         mask = cv2.resize(mask, (h_tar, w_tar), interpolation=cv2.INTER_NEAREST)
         mask.astype(np.uint8).tofile("mask_nd")
     else:
