@@ -37,6 +37,7 @@ from ..embeddings import (
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
 from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
+from semantic_match import get_match
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -74,6 +75,9 @@ def _get_qkv_projections(attn: "FluxAttention", hidden_states, encoder_hidden_st
 
 class FluxAttnProcessor:
     _attention_backend = None
+    _last_step_index = None
+    _local_in_step = 0
+    GLOBAL_STRIDE = 57
 
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
@@ -86,10 +90,28 @@ class FluxAttnProcessor:
         encoder_hidden_states: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        step_index: Optional[int] = None,   
+        timestep_int: Optional[int] = None,    
     ) -> torch.Tensor:
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
+        
+        if step_index is None:
+            step_index = 0
+        if step_index != FluxAttnProcessor._last_step_index:
+            FluxAttnProcessor._last_step_index = step_index
+            FluxAttnProcessor._local_in_step = 0
+        local_idx = FluxAttnProcessor._local_in_step
+        FluxAttnProcessor._local_in_step += 1
+        global_idx = step_index * FluxAttnProcessor.GLOBAL_STRIDE + local_idx
+
+
+        v_img = value
+        if v_img.shape[1] > 4096:
+            v_img = value[:, -4096:, :] # хардкод длины img токенов )))
+
+        get_match(global_idx, "VAL", v_img[0:1], v_img[1:2]) 
 
         query = query.unflatten(-1, (attn.heads, -1))
         key = key.unflatten(-1, (attn.heads, -1))
@@ -182,6 +204,8 @@ class FluxIPAdapterAttnProcessor(torch.nn.Module):
         image_rotary_emb: Optional[torch.Tensor] = None,
         ip_hidden_states: Optional[List[torch.Tensor]] = None,
         ip_adapter_masks: Optional[torch.Tensor] = None,
+        step_index: Optional[int] = None,   
+        timestep_int: Optional[int] = None,    
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
 
@@ -387,7 +411,7 @@ class FluxSingleTransformerBlock(nn.Module):
     ) -> torch.Tensor:
         text_seq_len = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-
+                
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
         mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
@@ -397,7 +421,8 @@ class FluxSingleTransformerBlock(nn.Module):
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
         )
-
+        _, hidden_states_t = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+        #get_match("SINGLE", hidden_states_t[0:1], hidden_states_t[1:2])
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
         gate = gate.unsqueeze(1)
         hidden_states = gate * self.proj_out(hidden_states)
@@ -406,6 +431,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = hidden_states.clip(-65504, 65504)
 
         encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+        #get_match("SINGLE", hidden_states[0:1], hidden_states[0:1])
         return encoder_hidden_states, hidden_states
 
 
@@ -459,15 +485,19 @@ class FluxTransformerBlock(nn.Module):
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
         )
-
+        #get_match("DOUBLE", hidden_states[0:1], hidden_states[1:2])
+        
         if len(attention_outputs) == 2:
             attn_output, context_attn_output = attention_outputs
         elif len(attention_outputs) == 3:
             attn_output, context_attn_output, ip_attn_output = attention_outputs
+        
 
         # Process attention outputs for the `hidden_states`.
         attn_output = gate_msa.unsqueeze(1) * attn_output
+        
         hidden_states = hidden_states + attn_output
+        
 
         norm_hidden_states = self.norm2(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
@@ -491,6 +521,7 @@ class FluxTransformerBlock(nn.Module):
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 
+        #get_match("DOUBLE", hidden_states[0:1], hidden_states[0:1])
         return encoder_hidden_states, hidden_states
 
 
